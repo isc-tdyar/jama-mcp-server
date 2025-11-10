@@ -22,6 +22,19 @@ class InvalidSecretFormatError(CredentialsError):
 
 logger = logging.getLogger(__name__)
 
+def get_bearer_token() -> str | None:
+    """
+    Retrieves JAMA bearer token from environment if available.
+
+    Returns:
+        str | None: Bearer token if found, None otherwise.
+    """
+    bearer_token = os.environ.get("JAMA_BEARER_TOKEN")
+    if bearer_token:
+        logger.info("Using JAMA_BEARER_TOKEN from environment variable.")
+        return bearer_token
+    return None
+
 def get_jama_credentials() -> Tuple[str, str]:
     """
     Retrieves Jama OAuth credentials (client_id, client_secret).

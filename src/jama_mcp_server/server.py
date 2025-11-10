@@ -4,7 +4,8 @@ from collections.abc import AsyncIterator
 import logging
 
 from mcp.server.fastmcp import FastMCP, Context
-from .auth import get_jama_credentials, CredentialsError
+from .auth import get_jama_credentials, get_bearer_token, CredentialsError
+from .tools import read_tools, test_tools, write_tools
 
 # Configure basic logging FIRST
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - SERVER - %(levelname)s - %(message)s')
@@ -18,11 +19,10 @@ if MOCK_MODE:
     logger.info("Using MockJamaClient due to JAMA_MOCK_MODE=true")
 else:
     try:
-        from py_jama_rest_client.client import JamaClient # Import the real client
-        logger.info("Using real py_jama_rest_client.client.JamaClient")
+        from .client import JamaClientWrapper as JamaClient  # Use our wrapper with rate limiting
+        logger.info("Using JamaClientWrapper with rate limiting and token refresh")
     except ImportError:
-        logger.error("Failed to import real JamaClient. Is py-jama-rest-client installed?")
-        # Exit or raise a more specific error if the real client is mandatory when not in mock mode
+        logger.error("Failed to import JamaClientWrapper. Check installation.")
         raise
 
 @asynccontextmanager
@@ -50,18 +50,35 @@ async def jama_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         # Let the lifespan fail, preventing server start without URL
         raise ValueError("JAMA_URL environment variable is required.")
 
+    # Get SSL verification setting (default to True for security)
+    verify_ssl = os.environ.get("JAMA_VERIFY_SSL", "true").lower() in ("true", "1", "yes")
+    logger.info(f"SSL verification {'enabled' if verify_ssl else 'disabled'}")
+
     jama_client = None
     try:
-        # Get credentials using the dedicated function
-        logger.info("Attempting to retrieve Jama credentials...")
-        client_id, client_secret = get_jama_credentials() # This handles AWS/Env Var logic and raises errors
-        logger.info("Successfully retrieved Jama credentials.")
+        # Check for bearer token first
+        bearer_token = get_bearer_token()
 
-        # Instantiate the client
-        logger.info(f"Attempting OAuth authentication to Jama at {jama_url}")
-        jama_client = JamaClient(host_domain=jama_url, credentials=(client_id, client_secret), oauth=True)
-        logger.info(f"Successfully configured JamaClient.")
+        if bearer_token:
+            # Use bearer token authentication (no OAuth flow)
+            from .client import BearerTokenJamaClient
+            logger.info(f"Using bearer token authentication to Jama at {jama_url}")
+            jama_client = BearerTokenJamaClient(
+                host_domain=jama_url,
+                bearer_token=bearer_token,
+                verify_ssl=verify_ssl
+            )
+            logger.info("Successfully configured BearerTokenJamaClient.")
+        else:
+            # Fall back to OAuth client credentials flow
+            logger.info("Attempting to retrieve OAuth credentials...")
+            client_id, client_secret = get_jama_credentials() # This handles AWS/Env Var logic and raises errors
+            logger.info("Successfully retrieved OAuth credentials.")
 
+            # Instantiate the OAuth client
+            logger.info(f"Attempting OAuth authentication to Jama at {jama_url}")
+            jama_client = JamaClient(host_domain=jama_url, credentials=(client_id, client_secret), oauth=True, verify_ssl=verify_ssl)
+            logger.info("Successfully configured JamaClient with OAuth.")
 
         yield {"jama_client": jama_client}
 
@@ -495,6 +512,458 @@ async def test_jama_connection(ctx: Context) -> dict:
     # Let any exceptions propagate
     endpoints = jama_client.get_available_endpoints()
     return endpoints # Return the actual result or let exception indicate failure
+
+
+# ============================================================================
+# User Story 1: Search and Retrieve (MVP) - New Tools
+# ============================================================================
+
+@mcp.tool()
+async def jama_search_items(
+    query: str,
+    ctx: Context,
+    project_id: int | None = None,
+    item_type_id: int | None = None,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Search for items in JAMA Connect using text query with optional filters.
+
+    Args:
+        query: Text search query
+        ctx: MCP context
+        project_id: Optional project ID to filter results
+        item_type_id: Optional item type ID to filter results
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20, max: 50)
+
+    Returns:
+        Search results with pagination info
+    """
+    return await read_tools.jama_search_items(
+        ctx, query, project_id, item_type_id, start_at, max_results
+    )
+
+
+@mcp.tool()
+async def jama_get_item_history(
+    item_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get version history for a specific JAMA item.
+
+    Args:
+        item_id: Item ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Version history with pagination info
+    """
+    return await read_tools.jama_get_item_history(ctx, item_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_project(project_id: int, ctx: Context) -> dict:
+    """Get details for a specific JAMA project by ID.
+
+    Args:
+        project_id: Project ID
+        ctx: MCP context
+
+    Returns:
+        Project data
+    """
+    return await read_tools.jama_get_project(ctx, project_id)
+
+
+@mcp.tool()
+async def jama_get_item_types(ctx: Context, project_id: int | None = None) -> list[dict]:
+    """Get available item types, optionally filtered by project.
+
+    Args:
+        ctx: MCP context
+        project_id: Optional project ID
+
+    Returns:
+        List of item type definitions
+    """
+    return await read_tools.jama_get_item_types(ctx, project_id)
+
+
+@mcp.tool()
+async def jama_get_item_type_fields(item_type_id: int, ctx: Context) -> list[dict]:
+    """Get field schema for a specific item type including custom fields.
+
+    Args:
+        item_type_id: Item type ID
+        ctx: MCP context
+
+    Returns:
+        List of field definitions
+    """
+    return await read_tools.jama_get_item_type_fields(ctx, item_type_id)
+
+
+# ============================================================================
+# User Story 2: Trace Relationships and Dependencies
+# ============================================================================
+
+@mcp.tool()
+async def jama_get_relationships(
+    item_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get all relationships for a specific item (upstream and downstream).
+
+    Args:
+        item_id: Item ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Relationships with pagination info
+    """
+    return await read_tools.jama_get_relationships(ctx, item_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_upstream_relationships(
+    item_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get upstream (parent) relationships for an item.
+
+    Args:
+        item_id: Item ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Upstream relationships with pagination info
+    """
+    return await read_tools.jama_get_upstream_relationships(ctx, item_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_downstream_relationships(
+    item_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get downstream (child) relationships for an item.
+
+    Args:
+        item_id: Item ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Downstream relationships with pagination info
+    """
+    return await read_tools.jama_get_downstream_relationships(ctx, item_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_relationship_types(ctx: Context, project_id: int | None = None) -> list[dict]:
+    """Get available relationship types.
+
+    Args:
+        ctx: MCP context
+        project_id: Optional project ID to filter relationship types
+
+    Returns:
+        List of relationship type definitions
+    """
+    return await read_tools.jama_get_relationship_types(ctx, project_id)
+
+
+# ============================================================================
+# User Story 7: Project and Baseline Management
+# ============================================================================
+
+@mcp.tool()
+async def jama_get_baselines(
+    project_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get baselines for a specific project.
+
+    Args:
+        project_id: Project ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Baselines with pagination info
+    """
+    return await read_tools.jama_get_baselines(ctx, project_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_baseline(baseline_id: int, ctx: Context) -> dict:
+    """Get baseline metadata by ID.
+
+    Args:
+        baseline_id: Baseline ID
+        ctx: MCP context
+
+    Returns:
+        Baseline data
+    """
+    return await read_tools.jama_get_baseline(ctx, baseline_id)
+
+
+@mcp.tool()
+async def jama_get_baseline_items(
+    baseline_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get items in a baseline (frozen snapshot).
+
+    Args:
+        baseline_id: Baseline ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Baseline items with pagination info
+    """
+    return await read_tools.jama_get_baseline_items(ctx, baseline_id, start_at, max_results)
+
+
+# ============================================================================
+# User Story 3: Test Management Access
+# ============================================================================
+
+@mcp.tool()
+async def jama_get_test_cases(
+    project_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get test cases for a specific project.
+
+    Args:
+        project_id: Project ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Test cases with pagination info
+    """
+    return await test_tools.jama_get_test_cases(ctx, project_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_test_case(test_case_id: int, ctx: Context) -> dict:
+    """Get details for a specific test case including test steps.
+
+    Args:
+        test_case_id: Test case item ID
+        ctx: MCP context
+
+    Returns:
+        Test case data with steps and expected results
+    """
+    return await test_tools.jama_get_test_case(ctx, test_case_id)
+
+
+@mcp.tool()
+async def jama_get_test_plans(
+    project_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get test plans for a specific project.
+
+    Args:
+        project_id: Project ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Test plans with pagination info
+    """
+    return await test_tools.jama_get_test_plans(ctx, project_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_test_runs(
+    test_cycle_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get test run results for a test cycle.
+
+    Args:
+        test_cycle_id: Test cycle ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Test run results with pagination info
+    """
+    return await test_tools.jama_get_test_runs(ctx, test_cycle_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_test_cycles(
+    project_id: int,
+    ctx: Context,
+    start_at: int = 0,
+    max_results: int = 20
+) -> dict:
+    """Get test cycles for a specific project.
+
+    Args:
+        project_id: Project ID
+        ctx: MCP context
+        start_at: Pagination offset (default: 0)
+        max_results: Maximum results (default: 20)
+
+    Returns:
+        Test cycles with pagination info
+    """
+    return await test_tools.jama_get_test_cycles(ctx, project_id, start_at, max_results)
+
+
+@mcp.tool()
+async def jama_get_test_case_results(test_run_id: int, ctx: Context) -> dict:
+    """Get execution results for a specific test run.
+
+    Args:
+        test_run_id: Test run ID
+        ctx: MCP context
+
+    Returns:
+        Test run result data with execution details
+    """
+    return await test_tools.jama_get_test_case_results(ctx, test_run_id)
+
+
+# ============================================================================
+# User Story 4: Create and Update Requirements (Write Operations)
+# ============================================================================
+
+@mcp.tool()
+async def jama_create_item(
+    project: int,
+    item_type: int,
+    name: str,
+    ctx: Context,
+    parent: int | None = None,
+    description: str | None = None,
+    **custom_fields
+) -> dict:
+    """Create a new JAMA item with validation.
+
+    Args:
+        project: Project ID
+        item_type: Item type ID
+        name: Item name/title (required)
+        ctx: MCP context
+        parent: Parent item ID for hierarchy (optional)
+        description: Item description (optional)
+        **custom_fields: Additional custom fields
+
+    Returns:
+        Created item data with ID
+    """
+    return await write_tools.jama_create_item(
+        ctx, project, item_type, parent, name, description, **custom_fields
+    )
+
+
+@mcp.tool()
+async def jama_update_item(
+    item_id: int,
+    ctx: Context,
+    patch: bool = True,
+    **fields
+) -> dict:
+    """Update an existing JAMA item (supports PATCH and PUT).
+
+    Args:
+        item_id: Item ID to update
+        ctx: MCP context
+        patch: If True, use PATCH (partial), else PUT (full)
+        **fields: Fields to update
+
+    Returns:
+        Updated item data
+    """
+    return await write_tools.jama_update_item(ctx, item_id, patch, **fields)
+
+
+@mcp.tool()
+async def jama_delete_item(item_id: int, ctx: Context) -> dict:
+    """Delete a JAMA item (soft delete).
+
+    Args:
+        item_id: Item ID to delete
+        ctx: MCP context
+
+    Returns:
+        Deletion confirmation
+    """
+    return await write_tools.jama_delete_item(ctx, item_id)
+
+
+@mcp.tool()
+async def jama_batch_create_items(items: list[dict], ctx: Context) -> dict:
+    """Create multiple JAMA items in batch.
+
+    Args:
+        items: List of item data dictionaries
+        ctx: MCP context
+
+    Returns:
+        Batch creation results
+    """
+    return await write_tools.jama_batch_create_items(ctx, items)
+
+
+@mcp.tool()
+async def jama_validate_item_fields(
+    item_type_id: int,
+    fields: dict,
+    ctx: Context
+) -> dict:
+    """Validate item fields against item type schema.
+
+    Args:
+        item_type_id: Item type ID
+        fields: Fields to validate
+        ctx: MCP context
+
+    Returns:
+        Validation results
+    """
+    return await write_tools.jama_validate_item_fields(ctx, item_type_id, fields)
 
 
 def main():
