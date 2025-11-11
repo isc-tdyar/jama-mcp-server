@@ -132,14 +132,16 @@ async def jama_create_item(
 async def jama_update_item(
     ctx: Context,
     item_id: int,
-    **fields
+    fields: Optional[Dict[str, Any]] = None,
+    **additional_fields
 ) -> Dict[str, Any]:
     """Update an existing JAMA item using JSON Patch (RFC 6902).
 
     Args:
         ctx: MCP context with JAMA client
         item_id: Item ID to update
-        **fields: Fields to update as keyword arguments
+        fields: Dictionary of fields to update (alternative to kwargs)
+        **additional_fields: Fields to update as keyword arguments
 
     Returns:
         Updated item data
@@ -151,17 +153,32 @@ async def jama_update_item(
         ServerError: On transient server errors (with retry)
 
     Example:
+        # Option 1: Using fields dict
+        await jama_update_item(
+            ctx=context,
+            item_id=29181,
+            fields={"name": "Updated Name", "description": "<p>Updated</p>"}
+        )
+
+        # Option 2: Using kwargs
         await jama_update_item(
             ctx=context,
             item_id=29181,
             name="Updated Name",
-            description="<p>Updated description</p>",
-            **{"rationale$134": "<p>Updated rationale</p>"}
+            description="<p>Updated description</p>"
         )
     """
     from jama_mcp_server.utils.json_patch import fields_to_json_patch
 
-    logger.info(f"Updating item: item_id={item_id}, fields={list(fields.keys())}")
+    # Merge fields dict and additional_fields kwargs
+    all_fields = {}
+    if fields:
+        all_fields.update(fields)
+    if additional_fields:
+        all_fields.update(additional_fields)
+
+    logger.info(f"Updating item: item_id={item_id}, fields={list(all_fields.keys())}")
+    fields = all_fields  # Use merged fields for rest of function
     jama_client = ctx.request_context.lifespan_context["jama_client"]
 
     # Validate at least one field provided

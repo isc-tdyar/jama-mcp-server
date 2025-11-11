@@ -902,14 +902,16 @@ async def jama_create_item(
 async def jama_update_item(
     item_id: int,
     ctx: Context,
-    **fields
+    fields: dict,
+    **additional_fields
 ) -> dict:
     """Update an existing JAMA item using JSON Patch (RFC 6902).
 
     Args:
         item_id: Item ID to update
         ctx: MCP context
-        **fields: Fields to update as keyword arguments
+        fields: Dictionary of fields to update
+        **additional_fields: Additional fields as keyword arguments
 
     Returns:
         Updated item data
@@ -918,11 +920,10 @@ async def jama_update_item(
         await jama_update_item(
             item_id=29181,
             ctx=context,
-            name="Updated Name",
-            description="<p>Updated description</p>"
+            fields={"name": "Updated Name", "description": "<p>Updated</p>"}
         )
     """
-    return await write_tools.jama_update_item(ctx, item_id, **fields)
+    return await write_tools.jama_update_item(ctx, item_id, fields, **additional_fields)
 
 
 @mcp.tool()
