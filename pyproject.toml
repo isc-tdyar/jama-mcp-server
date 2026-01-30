@@ -8,6 +8,7 @@ dependencies = [
     "mcp[cli]>=1.6.0",
     "py-jama-rest-client", # Keep the name here
     "boto3",
+    "tenacity>=9.1.2",
 ]
 
 [build-system]
