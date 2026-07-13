@@ -1,4 +1,5 @@
 import os
+import argparse
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 import logging
@@ -94,8 +95,25 @@ async def jama_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         logger.info("Jama lifespan context manager exiting.")
 
 
+# Tool filtering via ENABLED_TOOLS env var (comma-separated list of tool names)
+_ENABLED_TOOLS_RAW = os.environ.get("ENABLED_TOOLS", "")
+_ENABLED_TOOLS: set[str] | None = (
+    {t.strip() for t in _ENABLED_TOOLS_RAW.split(",") if t.strip()}
+    if _ENABLED_TOOLS_RAW.strip() else None
+)
+if _ENABLED_TOOLS is not None:
+    logger.info(f"Tool filtering active — {len(_ENABLED_TOOLS)} tools enabled: {sorted(_ENABLED_TOOLS)}")
+
+# Subclass FastMCP to inject tool filtering
+class FilteredFastMCP(FastMCP):
+    async def list_tools(self):
+        tools = await super().list_tools()
+        if _ENABLED_TOOLS is None:
+            return tools
+        return [t for t in tools if t.name in _ENABLED_TOOLS]
+
 # Instantiate the FastMCP server with the lifespan manager
-mcp = FastMCP(
+mcp = FilteredFastMCP(
     "Jama Connect Server",
     lifespan=jama_lifespan,
 )
@@ -973,9 +991,52 @@ async def jama_validate_item_fields(
     return await write_tools.jama_validate_item_fields(ctx, item_type_id, fields)
 
 
+def apply_cli_config(argv=None):
+    """Parse CLI configuration args and fold them into os.environ so the existing
+    env-var-based config resolution (auth.py, jama_lifespan, the JAMA_URL check) picks them up
+    unchanged. CLI args take precedence over pre-existing environment variables.
+
+    Added so hosts that launch this server as a managed subprocess (e.g. InterSystems Plaza's MCP
+    client, which passes config via command-line args) can supply connection + credentials without
+    setting process environment variables. Env-var and AWS-Parameter-Store paths remain fully
+    supported; args are simply a higher-priority source.
+    """
+    parser = argparse.ArgumentParser(
+        prog="jama-mcp-server",
+        description="Jama Connect MCP server. Config may be supplied via CLI args (below) or the "
+                    "equivalent JAMA_* environment variables; CLI args take precedence.",
+    )
+    parser.add_argument("--jama-url", dest="jama_url", default=None,
+                        help="Jama Connect base URL (overrides JAMA_URL).")
+    parser.add_argument("--jama-client-id", dest="jama_client_id", default=None,
+                        help="Jama OAuth client id (overrides JAMA_CLIENT_ID).")
+    parser.add_argument("--jama-client-secret", dest="jama_client_secret", default=None,
+                        help="Jama OAuth client secret (overrides JAMA_CLIENT_SECRET).")
+    parser.add_argument("--jama-bearer-token", dest="jama_bearer_token", default=None,
+                        help="Jama bearer token (overrides JAMA_BEARER_TOKEN).")
+    # parse_known_args so we never break other launch flags the runtime may pass.
+    args, _unknown = parser.parse_known_args(argv)
+
+    arg_to_env = {
+        "jama_url": "JAMA_URL",
+        "jama_client_id": "JAMA_CLIENT_ID",
+        "jama_client_secret": "JAMA_CLIENT_SECRET",
+        "jama_bearer_token": "JAMA_BEARER_TOKEN",
+    }
+    for attr, env_name in arg_to_env.items():
+        value = getattr(args, attr, None)
+        if value:
+            os.environ[env_name] = value
+            # Never log secret values — only that the source was a CLI arg.
+            logger.info(f"Config: {env_name} set from CLI argument.")
+
+
 def main():
     """Entry point for the jama-mcp-server script."""
     logger.info("Starting Jama MCP server...")
+
+    # Fold any CLI config args into the environment before config is read.
+    apply_cli_config()
 
     if not MOCK_MODE and not os.environ.get("JAMA_URL"):
         logger.error("JAMA_URL environment variable is not set when not in MOCK_MODE.")
